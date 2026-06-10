@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -257,6 +259,414 @@ def apply(
 
 
 @app.command()
+def ingest(
+    url: Optional[list[str]] = typer.Option(
+        None,
+        "--url",
+        help="Job URL to ingest (repeatable). Use Handshake job links for Handshake-first flow.",
+    ),
+    file: Optional[str] = typer.Option(
+        None,
+        "--file",
+        help="Path to a text file containing one URL per line.",
+    ),
+    site: str = typer.Option(
+        "Handshake",
+        "--site",
+        help="Source label stored in DB (default: Handshake).",
+    ),
+) -> None:
+    """Ingest job URLs directly into the database (Handshake-first workflow)."""
+    _bootstrap()
+
+    from applypilot.database import get_connection
+
+    urls: list[str] = []
+    if url:
+        urls.extend(url)
+
+    if file:
+        p = Path(file).expanduser()
+        if not p.exists():
+            console.print(f"[red]File not found:[/red] {p}")
+            raise typer.Exit(code=1)
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                urls.append(line)
+
+    # Normalize and deduplicate preserving order.
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for u in urls:
+        v = u.strip()
+        if not v:
+            continue
+        if not (v.startswith("http://") or v.startswith("https://")):
+            continue
+        key = v.split("#", 1)[0]
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(v)
+
+    if not cleaned:
+        console.print("[yellow]No valid URLs provided. Use --url or --file.[/yellow]")
+        raise typer.Exit(code=1)
+
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    new = 0
+    dupes = 0
+
+    for u in cleaned:
+        try:
+            conn.execute(
+                "INSERT INTO jobs (url, title, site, strategy, discovered_at) VALUES (?, ?, ?, ?, ?)",
+                (u, "(pending enrichment)", site, "manual_url", now),
+            )
+            new += 1
+        except Exception:
+            dupes += 1
+
+    conn.commit()
+
+    console.print("\n[bold]Ingest complete[/bold]")
+    console.print(f"  Site label: {site}")
+    console.print(f"  New URLs:   {new}")
+    console.print(f"  Duplicates: {dupes}")
+    console.print("\nNext: [bold]applypilot run enrich score tailor cover[/bold]")
+
+
+@app.command("focus-site")
+def focus_site(
+    site: str = typer.Option("Handshake", "--site", help="Only this site remains eligible for scoring/tailoring."),
+) -> None:
+    """Deprioritize all other sites by assigning low fit scores.
+
+    This keeps historical rows in the DB but prevents non-target sources from
+    being picked up by `run score`/`run tailor` in normal workflows.
+    """
+    _bootstrap()
+    from applypilot.database import get_connection
+
+    conn = get_connection()
+    # Mark non-target rows as already scored low-fit so they are skipped.
+    cur = conn.execute(
+        """
+        UPDATE jobs
+        SET fit_score = 1,
+            score_reasoning = COALESCE(score_reasoning, 'Deprioritized by focus-site filter'),
+            scored_at = COALESCE(scored_at, datetime('now'))
+        WHERE COALESCE(site, '') != ?
+          AND (fit_score IS NULL OR fit_score > 1)
+        """,
+        (site,),
+    )
+    conn.commit()
+
+    console.print("\n[bold]Focus filter applied[/bold]")
+    console.print(f"  Target site:   {site}")
+    console.print(f"  Rows adjusted: {cur.rowcount}")
+    console.print("\nNext: [bold]applypilot run enrich score tailor cover[/bold]")
+
+
+@app.command("handshake-sync")
+def handshake_sync(
+    search_url: str = typer.Option(
+        "",
+        "--search-url",
+        help="Filtered Handshake search URL from your logged-in account.",
+    ),
+    max_jobs: int = typer.Option(50, "--max-jobs", help="Maximum number of jobs to sync."),
+    scroll_rounds: int = typer.Option(8, "--scroll-rounds", help="Scroll cycles to load more job cards."),
+    headless: bool = typer.Option(False, "--headless", help="Run browser headless."),
+    profile_dir: str = typer.Option("Default", "--profile-dir", help="Chrome profile directory name."),
+    session_state: str = typer.Option(
+        "",
+        "--session-state",
+        help="Path to Playwright storage state JSON (for SSO). Defaults to ~/.applypilot/handshake_state.json.",
+    ),
+) -> None:
+    """Sync jobs directly from your filtered Handshake search page.
+
+    This uses your existing logged-in browser session and imports Handshake job
+    URLs/details into the ApplyPilot DB so you do not need manual URL collection.
+    """
+    _bootstrap()
+
+    import os
+    from applypilot.discovery.handshake import run_handshake_sync
+
+    target_url = search_url.strip() or os.environ.get("APPLYPILOT_HANDSHAKE_SEARCH_URL", "").strip()
+    if not target_url:
+        console.print(
+            "[red]Missing search URL.[/red]\n"
+            "Provide --search-url or set APPLYPILOT_HANDSHAKE_SEARCH_URL in ~/.applypilot/.env"
+        )
+        raise typer.Exit(code=1)
+
+    if "joinhandshake.com" not in target_url:
+        console.print("[yellow]Warning:[/yellow] URL does not look like Handshake. Continuing anyway.")
+
+    console.print("\n[bold blue]Handshake Sync[/bold blue]")
+    console.print(f"  URL:          {target_url[:120]}")
+    console.print(f"  Max jobs:     {max_jobs}")
+    console.print(f"  Scroll rounds:{scroll_rounds}")
+    console.print(f"  Headless:     {headless}")
+    console.print(f"  Profile dir:  {profile_dir}")
+    if session_state.strip():
+        console.print(f"  Session file: {session_state.strip()}")
+
+    try:
+        stats = run_handshake_sync(
+            search_url=target_url,
+            max_jobs=max_jobs,
+            scroll_rounds=scroll_rounds,
+            headless=headless,
+            profile_dir=profile_dir,
+            session_state_path=session_state.strip() or None,
+        )
+    except Exception as e:
+        console.print(f"\n[red]Handshake sync failed:[/red] {e}")
+        raise typer.Exit(code=1)
+
+    console.print("\n[bold]Sync complete[/bold]")
+    console.print(f"  Links discovered: {stats.get('discovered', 0)}")
+    console.print(f"  Jobs processed:   {stats.get('processed', 0)}")
+    console.print(f"  New rows:         {stats.get('new', 0)}")
+    console.print(f"  Updated rows:     {stats.get('updated', 0)}")
+    console.print(f"  Duplicates:       {stats.get('duplicates', 0)}")
+    console.print(f"  Errors:           {stats.get('errors', 0)}")
+    console.print(f"  Saved session:    {stats.get('session_state', '')}")
+    console.print(f"  Used session:     {stats.get('used_saved_session', False)}")
+
+    if stats.get("discovered", 0) == 0:
+        console.print("\n[yellow]No Handshake jobs were discovered.[/yellow]")
+        console.print("If you use SSO, run [bold]applypilot handshake-login[/bold] once, then retry sync.")
+
+    console.print("\nNext:")
+    console.print("  1) applypilot focus-site --site Handshake")
+    console.print("  2) applypilot run score tailor cover")
+    console.print("  3) applypilot apply --dry-run")
+
+
+@app.command("handshake-login")
+def handshake_login(
+    search_url: str = typer.Option(
+        "",
+        "--search-url",
+        help="Filtered Handshake search URL from your logged-in account.",
+    ),
+    profile_dir: str = typer.Option("Default", "--profile-dir", help="Chrome profile directory name."),
+    max_wait: int = typer.Option(300, "--max-wait", help="Seconds to wait for you to complete SSO login."),
+    session_state: str = typer.Option(
+        "",
+        "--session-state",
+        help="Where to save session state JSON. Defaults to ~/.applypilot/handshake_state.json.",
+    ),
+) -> None:
+    """Open a browser, complete SSO login, and save reusable Handshake session state."""
+    _bootstrap()
+
+    import os
+    from applypilot.discovery.handshake import capture_handshake_session
+
+    target_url = search_url.strip() or os.environ.get("APPLYPILOT_HANDSHAKE_SEARCH_URL", "").strip()
+    if not target_url:
+        console.print(
+            "[red]Missing search URL.[/red]\n"
+            "Provide --search-url or set APPLYPILOT_HANDSHAKE_SEARCH_URL in ~/.applypilot/.env"
+        )
+        raise typer.Exit(code=1)
+
+    console.print("\n[bold blue]Handshake Login (SSO)[/bold blue]")
+    console.print(f"  URL:         {target_url[:120]}")
+    console.print(f"  Profile dir: {profile_dir}")
+    console.print(f"  Wait time:   {max_wait}s")
+    if session_state.strip():
+        console.print(f"  Session file:{session_state.strip()}")
+
+    console.print("\nComplete Wesleyan SSO in the opened browser window. This command will save your session automatically.")
+
+    try:
+        result = capture_handshake_session(
+            search_url=target_url,
+            profile_dir=profile_dir,
+            max_wait_seconds=max_wait,
+            session_state_path=session_state.strip() or None,
+        )
+    except Exception as e:
+        console.print(f"\n[red]Handshake login failed:[/red] {e}")
+        raise typer.Exit(code=1)
+
+    console.print("\n[bold]Handshake session saved[/bold]")
+    console.print(f"  Session file: {result.get('session_state', '')}")
+    console.print(f"  Auth detected: {result.get('authenticated', False)}")
+    console.print(f"  Final URL:     {result.get('final_url', '')[:120]}")
+    if not result.get("authenticated", False):
+        console.print("[yellow]I did not detect job cards before timeout. You can still retry handshake-sync with this session state.[/yellow]")
+    console.print("\nNext: [bold]applypilot handshake-sync --headless[/bold]")
+
+
+@app.command("handshake-apply")
+def handshake_apply(
+    max_jobs: int = typer.Option(10, "--max-jobs", help="Maximum number of Handshake jobs to apply to."),
+    min_score: int = typer.Option(7, "--min-score", help="Minimum fit_score threshold."),
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--submit",
+        help="Fill forms but do not click Submit (default). Pass --submit to actually apply.",
+    ),
+    headless: bool = typer.Option(False, "--headless", help="Run browser headless."),
+    session_state: str = typer.Option(
+        "",
+        "--session-state",
+        help="Path to Playwright storage state JSON. Defaults to ~/.applypilot/handshake_state.json.",
+    ),
+    season: list[str] = typer.Option(
+        None,
+        "--season",
+        help=(
+            "Restrict to jobs mentioning this string in title or description. "
+            "Repeatable: --season 'Fall 2026' --season 'Summer 2026'."
+        ),
+    ),
+    bootstrap_resumes: bool = typer.Option(
+        True,
+        "--bootstrap-resumes/--no-bootstrap-resumes",
+        help=(
+            "Attach a static per-role PDF (Quant/SWE/Analyst/General) when "
+            "tailored_resume_path is NULL. DB rows are not mutated."
+        ),
+    ),
+    role_resumes_dir: str = typer.Option(
+        "",
+        "--role-resumes-dir",
+        help=(
+            "Override path to the directory holding SWE/Quant/General/Analyst "
+            "subdirs. Defaults to ../../Resumes/Resume/Roles relative to the "
+            "project (or env APPLYPILOT_ROLE_RESUMES_DIR)."
+        ),
+    ),
+    use_llm_qa: bool = typer.Option(
+        True,
+        "--llm-qa/--no-llm-qa",
+        help=(
+            "Answer free-text screener questions via the configured LLM. "
+            "Silently degrades to known-answers-only if no LLM is configured."
+        ),
+    ),
+    min_sleep: float = typer.Option(
+        30.0,
+        "--min-sleep",
+        help="Minimum seconds of random sleep between submits (human-pacing).",
+    ),
+    max_sleep: float = typer.Option(
+        90.0,
+        "--max-sleep",
+        help="Maximum seconds of random sleep between submits (human-pacing).",
+    ),
+    max_per_day: int = typer.Option(
+        30,
+        "--max-per-day",
+        help=(
+            "Hard cap on real submits per day (local time). Dry-runs don't "
+            "count. Defends a university-tied account against bulk-apply "
+            "flags. 30 is a conservative default."
+        ),
+    ),
+) -> None:
+    """Apply to Handshake jobs using the saved SSO session state.
+
+    Drives Handshake's React SPA modal directly with Playwright — no Claude
+    Code / MCP overhead. Pulls Handshake-site jobs from the DB matching the
+    score threshold (and optional --season filter), bootstraps a static
+    per-role resume PDF for jobs missing one, uses an LLM to answer
+    free-text screener questions, and paces submits 30-90s apart to look
+    human. Aborts automatically after 2 consecutive login_issue results.
+    """
+    _bootstrap()
+
+    from applypilot.apply.handshake import run_handshake_apply
+    from pathlib import Path as _Path
+
+    season_keywords = list(season) if season else None
+    role_dir_override = (
+        _Path(role_resumes_dir).expanduser() if role_resumes_dir.strip() else None
+    )
+
+    console.print("\n[bold blue]Handshake Apply[/bold blue]")
+    console.print(f"  Max jobs:        {max_jobs}")
+    console.print(f"  Min score:       {min_score}")
+    console.print(f"  Mode:            {'DRY-RUN (no submit)' if dry_run else 'SUBMIT'}")
+    console.print(f"  Headless:        {headless}")
+    console.print(f"  Bootstrap PDFs:  {bootstrap_resumes}")
+    console.print(f"  LLM Q&A:         {use_llm_qa}")
+    if season_keywords:
+        console.print(f"  Season filter:   {', '.join(season_keywords)}")
+    console.print(f"  Sleep range:     {min_sleep:.0f}-{max_sleep:.0f}s")
+    console.print(f"  Daily cap:       {max_per_day} (real submits, local-day)")
+    if session_state.strip():
+        console.print(f"  Session:         {session_state.strip()}")
+    if role_dir_override is not None:
+        console.print(f"  Role PDFs dir:   {role_dir_override}")
+
+    try:
+        stats = run_handshake_apply(
+            max_jobs=max_jobs,
+            min_score=min_score,
+            dry_run=dry_run,
+            headless=headless,
+            session_state_path=session_state.strip() or None,
+            season_keywords=season_keywords,
+            bootstrap_resumes=bootstrap_resumes,
+            role_resumes_dir=role_dir_override,
+            use_llm_qa=use_llm_qa,
+            min_sleep_seconds=min_sleep,
+            max_sleep_seconds=max_sleep,
+            max_per_day=max_per_day,
+        )
+    except RuntimeError as e:
+        console.print(f"\n[red]Handshake apply failed:[/red] {e}")
+        raise typer.Exit(code=1)
+    except Exception as e:
+        console.print(f"\n[red]Unexpected error:[/red] {e}")
+        raise typer.Exit(code=1)
+
+    console.print("\n[bold]Apply complete[/bold]")
+    console.print(f"  Processed:       {stats.get('processed', 0)}")
+    console.print(f"  Applied:         {stats.get('applied', 0)}")
+    console.print(f"  Dry runs:        {stats.get('dry_runs', 0)}")
+    console.print(f"  Failed:          {stats.get('failed', 0)}")
+    console.print(f"  Bootstrapped:    {stats.get('bootstrapped', 0)}")
+    if stats.get("skipped_no_resume", 0):
+        console.print(f"  Skipped (no resume): {stats.get('skipped_no_resume', 0)}")
+    console.print(f"  LLM Q&A status:  {stats.get('llm_qa', 'off')}")
+
+    if stats.get("aborted"):
+        if stats.get("abort_reason") == "daily_cap_reached":
+            console.print(
+                f"\n[yellow]Daily cap reached:[/yellow] {stats.get('today_applied', 0)}/{stats.get('max_per_day', 0)} "
+                "submits already done today. Re-run after midnight (local time) or raise --max-per-day."
+            )
+        else:
+            console.print(
+                f"\n[red]Aborted:[/red] {stats.get('abort_reason')}. "
+                "Run [bold]applypilot handshake-login[/bold] to refresh the SSO session state."
+            )
+    elif stats.get("processed", 0) == 0:
+        console.print(
+            "\n[yellow]No eligible Handshake jobs found.[/yellow] "
+            "Check fit_score threshold and season filter; ensure jobs were sync'd."
+        )
+    elif dry_run and stats.get("dry_runs", 0) > 0:
+        console.print(
+            "\n[dim]Dry-run jobs remain re-applyable. Re-run with [bold]--submit[/bold] to actually apply.[/dim]"
+        )
+
+
+@app.command()
 def status() -> None:
     """Show pipeline statistics from the database."""
     _bootstrap()
@@ -383,17 +793,24 @@ def doctor() -> None:
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
+    use_claude_code_llm = os.environ.get("LLM_PROVIDER", "").strip().lower() == "claude_code"
+    claude_bin = shutil.which("claude")
     if has_gemini:
         model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
         results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
+    elif use_claude_code_llm and claude_bin:
+        model = os.environ.get("LLM_MODEL", "haiku")
+        results.append(("LLM backend", ok_mark, f"Claude Code CLI ({model})"))
+    elif use_claude_code_llm and not claude_bin:
+        results.append(("LLM backend", fail_mark, "LLM_PROVIDER=claude_code set, but Claude Code CLI not found"))
     elif has_openai:
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
         results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
     elif has_local:
         results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
     else:
-        results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+        results.append(("LLM backend", fail_mark,
+                "Set GEMINI_API_KEY or LLM_PROVIDER=claude_code in ~/.applypilot/.env (run 'applypilot init')"))
 
     # --- Tier 3 checks ---
     # Claude Code CLI
@@ -445,7 +862,7 @@ def doctor() -> None:
     console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
 
     if tier == 1:
-        console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
+        console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs an LLM API key)[/dim]")
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
     elif tier == 2:
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")

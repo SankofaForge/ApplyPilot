@@ -36,6 +36,10 @@ applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment
 applypilot apply         # autonomous browser-driven submission
 applypilot apply -w 3    # parallel apply (3 Chrome instances)
 applypilot apply --dry-run  # fill forms without submitting
+
+# Handshake + university SSO flow (one-time login, then repeatable sync)
+applypilot handshake-login --search-url "https://wesleyan.joinhandshake.com/stu/postings?..."
+applypilot handshake-sync --headless
 ```
 
 > **Why two install commands?** `python-jobspy` pins an exact numpy version in its metadata that conflicts with pip's resolver, but works fine at runtime with any modern numpy. The `--no-deps` flag bypasses the resolver; the second command installs jobspy's actual runtime dependencies. Everything except `python-jobspy` installs normally.
@@ -95,6 +99,7 @@ Each stage is independent. Run them all or pick what you need.
 | Claude Code CLI | Auto-apply | Install from [claude.ai/code](https://claude.ai/code) |
 
 **Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenAI and local models (Ollama/llama.cpp) are also supported.
+You can also use Claude Code CLI for scoring/tailoring by setting `LLM_PROVIDER=claude_code` and `LLM_MODEL=haiku|sonnet|opus` in `.env`.
 
 ### Optional
 
@@ -118,6 +123,8 @@ Job search queries, target titles, locations, boards. Run multiple searches with
 
 ### `.env`
 API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional).
+
+For Claude Code CLI scoring/tailoring (no API key), set `LLM_PROVIDER=claude_code` and `LLM_MODEL=haiku|sonnet|opus`.
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)
@@ -176,6 +183,8 @@ applypilot apply --dry-run              # Fill forms without submitting
 applypilot apply --continuous           # Run forever, polling for new jobs
 applypilot apply --headless             # Headless browser mode
 applypilot apply --url URL              # Apply to a specific job
+applypilot handshake-login              # Capture Handshake SSO session state
+applypilot handshake-sync               # Sync jobs from your Handshake filtered URL
 applypilot status                       # Pipeline statistics
 applypilot dashboard                    # Open HTML results dashboard
 ```

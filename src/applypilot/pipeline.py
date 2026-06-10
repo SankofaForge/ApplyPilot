@@ -13,6 +13,7 @@ Usage (via CLI):
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from datetime import datetime
@@ -61,6 +62,10 @@ _UPSTREAM: dict[str, str | None] = {
 
 def _run_discover(workers: int = 1) -> dict:
     """Stage: Job discovery — JobSpy, Workday, and smart-extract scrapers."""
+    if os.environ.get("APPLYPILOT_DISCOVERY_MODE", "").strip().lower() == "manual_urls":
+        console.print("  [yellow]Discovery skipped (APPLYPILOT_DISCOVERY_MODE=manual_urls).[/yellow]")
+        return {"status": "skipped(manual_urls)"}
+
     stats: dict = {"jobspy": None, "workday": None, "smartextract": None}
 
     # JobSpy
