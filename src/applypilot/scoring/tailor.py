@@ -11,12 +11,19 @@ to avoid apologetic spirals.
 
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
+from applypilot.config import (
+    RESUME_PATH,
+    RESUME_ROLES,
+    RESUME_TEMPLATES_DIR,
+    TAILORED_DIR,
+    load_profile,
+)
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
@@ -425,6 +432,8 @@ def tailor_resume(
 
         # Assemble text (header injected by code, em dashes auto-fixed)
         tailored = assemble_resume_text(data, profile)
+        # Stash the validated JSON so the LaTeX render stage can typeset it.
+        report["resume_json"] = data
 
         # Layer 2: LLM judge (catches subtle fabrication) — skipped in lenient mode
         if validation_mode == "lenient":
@@ -470,6 +479,12 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     profile = load_profile()
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
+
+    # Role routing for the LaTeX render stage (config default + opt-in auto-route).
+    resume_role = os.environ.get("APPLYPILOT_RESUME_ROLE", "SWE").strip()
+    if resume_role not in RESUME_ROLES:
+        resume_role = "SWE"
+    auto_role = os.environ.get("APPLYPILOT_AUTO_ROLE", "").strip().lower() in ("1", "true", "yes")
 
     jobs = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=limit)
 
@@ -518,17 +533,35 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             # Generate PDF for approved resumes (best-effort)
             # "approved_with_judge_warning" is also a success — resume was generated.
             pdf_path = None
+            role_used = None
             if report["status"] in ("approved", "approved_with_judge_warning"):
-                try:
-                    from applypilot.scoring.pdf import convert_to_pdf
-                    pdf_path = str(convert_to_pdf(txt_path))
-                except Exception:
-                    log.debug("PDF generation failed for %s", txt_path, exc_info=True)
+                pdf_target = txt_path.with_suffix(".pdf")
+                resume_json = report.get("resume_json")
+                # Preferred path: render through the user's LaTeX template when
+                # one is configured. Falls back to the HTML→PDF renderer.
+                if resume_json is not None and RESUME_TEMPLATES_DIR is not None:
+                    try:
+                        from applypilot.scoring.latex import tailored_json_to_pdf
+                        out, role_used = tailored_json_to_pdf(
+                            resume_json, job, pdf_target,
+                            default_role=resume_role, auto_role=auto_role,
+                        )
+                        pdf_path = str(out)
+                    except Exception:
+                        log.debug("LaTeX render failed for %s; falling back to HTML",
+                                  txt_path, exc_info=True)
+                if pdf_path is None:
+                    try:
+                        from applypilot.scoring.pdf import convert_to_pdf
+                        pdf_path = str(convert_to_pdf(txt_path))
+                    except Exception:
+                        log.debug("PDF generation failed for %s", txt_path, exc_info=True)
 
             result = {
                 "url": job["url"],
                 "path": str(txt_path),
                 "pdf_path": pdf_path,
+                "role": role_used,
                 "title": job["title"],
                 "site": job["site"],
                 "status": report["status"],

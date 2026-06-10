@@ -29,6 +29,41 @@ APPLY_WORKER_DIR = APP_DIR / "apply-workers"
 PACKAGE_DIR = Path(__file__).parent
 CONFIG_DIR = PACKAGE_DIR / "config"
 
+# LaTeX resume templates (the user's hand-built .tex variants, kept outside the
+# package). Layout: <dir>/<Role>/<...>_<Variant>.tex — e.g.
+#   ~/resumes/SWE/Olayinka_Vaughan_SWE_Resume_Digital.tex
+# Set via APPLYPILOT_RESUME_TEMPLATES_DIR. When unset, the LaTeX render path is
+# skipped and tailoring falls back to the HTML→PDF renderer in scoring/pdf.py.
+RESUME_TEMPLATES_DIR = (
+    Path(os.environ["APPLYPILOT_RESUME_TEMPLATES_DIR"]).expanduser()
+    if os.environ.get("APPLYPILOT_RESUME_TEMPLATES_DIR")
+    else None
+)
+
+# Routable role variants. Default role used for the whole run; per-job
+# auto-routing into one of these is opt-in via APPLYPILOT_AUTO_ROLE=1.
+RESUME_ROLES = ("SWE", "Quant", "Analyst", "General")
+
+
+def resume_template_path(role: str, variant: str | None = None) -> Path | None:
+    """Resolve the .tex template for a role variant under RESUME_TEMPLATES_DIR.
+
+    Globs ``<dir>/<role>/*_<variant>.tex`` (variant defaults to
+    APPLYPILOT_RESUME_VARIANT or "Digital"). Returns the first match, or None
+    if templates are not configured or no file matches.
+    """
+    if RESUME_TEMPLATES_DIR is None:
+        return None
+    variant = variant or os.environ.get("APPLYPILOT_RESUME_VARIANT", "Digital")
+    role_dir = RESUME_TEMPLATES_DIR / role
+    if not role_dir.is_dir():
+        return None
+    matches = sorted(role_dir.glob(f"*_{variant}.tex"))
+    if not matches:
+        # Fall back to any .tex in the role dir if the variant suffix is absent.
+        matches = sorted(role_dir.glob("*.tex"))
+    return matches[0] if matches else None
+
 
 def get_chrome_path() -> str:
     """Auto-detect Chrome/Chromium executable path, cross-platform.
