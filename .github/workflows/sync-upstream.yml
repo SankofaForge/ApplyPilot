@@ -1,0 +1,56 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # Daily at 3 AM UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync with upstream Pickle-Pixel/ApplyPilot
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/Pickle-Pixel/ApplyPilot.git
+
+      - name: Fetch upstream
+        run: git fetch upstream main
+
+      - name: Check if sync needed
+        id: check
+        run: |
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse upstream/main)
+          if [ "$LOCAL" = "$UPSTREAM" ]; then
+            echo "already_synced=true" >> $GITHUB_OUTPUT
+            echo "Fork is already up to date with upstream"
+          else
+            echo "already_synced=false" >> $GITHUB_OUTPUT
+            echo "Fork is behind upstream by $(git rev-list --count HEAD..upstream/main) commits"
+          fi
+
+      - name: Merge upstream
+        if: steps.check.outputs.already_synced == 'false'
+        run: |
+          git merge upstream/main --no-edit --ff-only || {
+            echo "::warning::Fast-forward failed, attempting merge with strategy"
+            git merge upstream/main --no-edit -X ours
+          }
+
+      - name: Push to fork
+        if: steps.check.outputs.already_synced == 'false'
+        run: git push origin main
